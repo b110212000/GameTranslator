@@ -12,8 +12,30 @@ The first release covers receiving teammate speech and displaying subtitles only
 
 - Development location: `D:\GameTranslator` on Windows.
 - Audio routing, headset playback, subtitle-overlay compatibility, and packaging as an EXE will be tested on this Windows machine.
-- Current status: planning only; implementation has not started.
+- Current status: MVP 1 implements a Windows preview control window and a
+  separate subtitle overlay. Audio capture and translation are not yet wired in.
 
 ## Initial technical direction
 
 Prototype the pipeline with recorded English audio first, then integrate Windows audio and the game. Options under consideration include Python, faster-whisper, and PySide6.
+
+## Run the MVP 1 subtitle preview
+
+No third-party packages are required; the included Python 3.12 Tkinter runtime
+is used.
+
+```powershell
+cd D:\GameTranslator
+py app.py
+```
+
+1. The main window opens in **待機** (idle) and identifies itself as **預覽模式**.
+2. Select **開始預覽** to display the one-line Traditional Chinese test
+   subtitle in a separate transparent, always-on-top window.
+3. Select **停止預覽** to hide that overlay and return to **待機**.
+4. To preview a different line, edit the subtitle text box and press Enter
+   while preview is running.
+
+Future recognizer/translator code can send replacement subtitle text through
+`GameTranslatorApp.set_subtitle_text(text)`. Calls from a worker thread are
+scheduled on the UI event loop; no direct widget access is required.
