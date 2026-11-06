@@ -46,7 +46,7 @@ class SubtitleOverlay:
             foreground="#d7d7d7",
             background="#1d1d1d",
             padx=22,
-            pady=(10, 2),
+            pady=2,
         )
         self.english_label.pack(padx=12, pady=(12, 0))
         self.label = tk.Label(
@@ -56,7 +56,7 @@ class SubtitleOverlay:
             foreground="white",
             background="#1d1d1d",
             padx=22,
-            pady=(2, 10),
+            pady=10,
         )
         self.label.pack(padx=12, pady=(0, 12))
 
