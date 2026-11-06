@@ -79,3 +79,8 @@ any Windows default device. With VB-Audio Virtual Cable installed, choose
 **CABLE Input**, then select your headphone/speaker endpoint as the output.
 Actual capture, passthrough and VALORANT validation remain deferred until the
 final hardware test.
+
+Selecting **開始即時音訊** now opens the selected capture and playback devices:
+original audio is copied directly to the chosen headphones while English speech
+blocks are processed in a background thread for subtitles. This app never
+speaks a Chinese translation aloud. Use **停止預覽** to close both streams.

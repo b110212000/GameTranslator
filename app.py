@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk
+from queue import Empty, Queue
 
 from audio_devices import AudioDevice, list_input_devices, list_output_devices
+from audio_router import AudioRoute, AudioRouter
+from live_captioner import LiveCaptioner
 
 
 PREVIEW_SUBTITLE = "隊友正在 A 點佈防，小心右側！"
@@ -79,6 +82,9 @@ class GameTranslatorApp:
         self.root.resizable(False, False)
         self.overlay = SubtitleOverlay(root)
         self.is_previewing = False
+        self.router: AudioRouter | None = None
+        self.captioner: LiveCaptioner | None = None
+        self.live_captions: Queue[str] = Queue()
         self.input_devices: list[AudioDevice] = []
         self.output_devices: list[AudioDevice] = []
 
@@ -112,7 +118,9 @@ class GameTranslatorApp:
         self.output_choice = tk.StringVar()
         self.output_select = ttk.Combobox(container, textvariable=self.output_choice, width=55, state="readonly")
         self.output_select.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(4, 6))
-        ttk.Button(container, text="重新掃描裝置", command=self.refresh_audio_devices).grid(row=9, column=0, columnspan=2, sticky="w")
+        ttk.Button(container, text="重新掃描裝置", command=self.refresh_audio_devices).grid(row=9, column=0, sticky="w")
+        self.live_button = ttk.Button(container, text="開始即時音訊", command=self.start_live_audio)
+        self.live_button.grid(row=9, column=1, sticky="e")
 
         ttk.Label(container, text="字幕文字入口（供後續音訊／翻譯模組呼叫）：").grid(
             row=10, column=0, columnspan=2, sticky="w", pady=(20, 4)
@@ -123,6 +131,7 @@ class GameTranslatorApp:
         self.entry.bind("<Return>", lambda _event: self.set_subtitle_text(self.subtitle_input.get()))
 
         self.refresh_audio_devices()
+        self.root.after(50, self.poll_live_captions)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def refresh_audio_devices(self) -> None:
@@ -158,12 +167,49 @@ class GameTranslatorApp:
         self.stop_button.configure(state="normal")
         self.set_subtitle_text(self.subtitle_input.get() or PREVIEW_SUBTITLE)
 
+    def start_live_audio(self) -> None:
+        capture, playback = self.selected_audio_device_indexes()
+        if capture is None or playback is None:
+            self.status.set("請先選擇輸入與耳機輸出裝置")
+            return
+        try:
+            self.captioner = LiveCaptioner(lambda caption: self.live_captions.put(caption.traditional_chinese_text))
+            self.captioner.start()
+            self.router = AudioRouter(AudioRoute(capture, playback), self.captioner.submit)
+            self.router.start()
+        except Exception as error:
+            if self.captioner is not None:
+                self.captioner.stop()
+            self.captioner = None
+            self.router = None
+            self.status.set(f"音訊啟動失敗：{error}")
+            return
+        self.is_previewing = True
+        self.status.set("即時翻譯中")
+        self.live_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        self.overlay.show_subtitle("即時音訊已啟動，等待英文語音…")
+
     def stop_preview(self) -> None:
+        if self.router is not None:
+            self.router.stop()
+            self.router = None
+        if self.captioner is not None:
+            self.captioner.stop()
+            self.captioner = None
         self.is_previewing = False
         self.status.set("待機")
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self.overlay.hide()
+
+    def poll_live_captions(self) -> None:
+        try:
+            while True:
+                self.set_subtitle_text(self.live_captions.get_nowait())
+        except Empty:
+            pass
+        self.root.after(50, self.poll_live_captions)
 
     def set_subtitle_text(self, text: str) -> None:
         """Public subtitle entry point for future recognition/translation code."""

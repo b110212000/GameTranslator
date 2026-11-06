@@ -41,8 +41,13 @@ class RecordedAudioPipeline:
 
     def process_wav(self, wav_path: Path) -> list[CaptionResult]:
         """Recognize one completed WAV and translate each non-empty segment."""
-        started_at = perf_counter()
         audio = load_pcm_wav_as_16khz_mono(wav_path)
+        return self.process_audio(audio, 16000, str(wav_path))
+
+    def process_audio(self, audio: np.ndarray, sample_rate: int, source: str = "live") -> list[CaptionResult]:
+        """Process a completed live audio chunk using the same caption pipeline."""
+        started_at = perf_counter()
+        audio = resample_to_16khz_mono(audio, sample_rate)
         segments, _info = self.model.transcribe(
             audio,
             language="en",
@@ -57,7 +62,7 @@ class RecordedAudioPipeline:
             translated = self.translator.translate(english)
             results.append(
                 CaptionResult(
-                    source_file=str(wav_path),
+                    source_file=source,
                     english_text=english,
                     traditional_chinese_text=translated,
                     segment_end_seconds=round(segment.end, 3),
@@ -94,6 +99,17 @@ def load_pcm_wav_as_16khz_mono(wav_path: Path) -> np.ndarray:
     if sample_rate == 16000:
         return audio
 
+    source_positions = np.arange(len(audio), dtype=np.float64)
+    target_length = round(len(audio) * 16000 / sample_rate)
+    target_positions = np.linspace(0, len(audio) - 1, target_length)
+    return np.interp(target_positions, source_positions, audio).astype(np.float32)
+
+
+def resample_to_16khz_mono(audio: np.ndarray, sample_rate: int) -> np.ndarray:
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    if sample_rate == 16000:
+        return audio.astype(np.float32, copy=False)
     source_positions = np.arange(len(audio), dtype=np.float64)
     target_length = round(len(audio) * 16000 / sample_rate)
     target_positions = np.linspace(0, len(audio) - 1, target_length)
