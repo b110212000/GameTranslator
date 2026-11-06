@@ -87,3 +87,14 @@ preloaded before they receive speech, and live chunks are 0.75 seconds to
 reduce caption delay. The overlay shows the English original above its larger
 Traditional Chinese translation. This app never speaks a Chinese translation
 aloud. Use **停止預覽** to close both streams.
+
+## Build a double-clickable Windows app
+
+```powershell
+cd D:\GameTranslator
+powershell -ExecutionPolicy Bypass -File scripts\build_app.ps1
+```
+
+Then double-click `D:\GameTranslator\dist\GameTranslator.exe`. The EXE opens
+without a terminal window. Build output is ignored by Git; the local translation
+model is installed once for the current Windows user and is reused by the app.
