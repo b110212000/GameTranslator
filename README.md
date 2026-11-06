@@ -37,5 +37,34 @@ py app.py
    while preview is running.
 
 Future recognizer/translator code can send replacement subtitle text through
-`GameTranslatorApp.set_subtitle_text(text)`. Calls from a worker thread are
-scheduled on the UI event loop; no direct widget access is required.
+`GameTranslatorApp.set_subtitle_text(text)` from the UI event loop. The recorded
+demo uses a queue to marshal worker results back to that event loop, so worker
+code never accesses Tk widgets directly.
+
+## Run the MVP 3 recorded-audio prototype
+
+This prototype uses `faster-whisper` with the CPU-friendly `base.en` model and
+MyMemory through `deep-translator` for English → Traditional Chinese. It needs
+Internet access the first time to download the Whisper model and while
+translating; no API key is used. The pipeline accepts completed WAV files so a
+future live-capture task can send audio chunks through the same code.
+
+```powershell
+cd D:\GameTranslator
+py -m pip install -r requirements.txt
+powershell -ExecutionPolicy Bypass -File scripts\generate_sample_audio.ps1
+py recorded_demo.py
+```
+
+The last command prints one JSON record per caption, including the recognized
+English, Traditional Chinese result, and processing latency measured from the
+point each completed WAV becomes available. To display results through the
+subtitle preview UI instead, run:
+
+```powershell
+py recorded_demo.py --preview
+```
+
+The generated WAV files are created locally from Windows speech synthesis and
+are ignored by Git. Use your own authorized English WAV files by appending their
+paths to `recorded_demo.py`.

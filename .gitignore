@@ -34,3 +34,7 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Locally generated test recordings and model cache
+samples/*.wav
+.cache/
