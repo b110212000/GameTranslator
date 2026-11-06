@@ -37,26 +37,42 @@ class SubtitleOverlay:
         except tk.TclError:
             pass
 
-        self.text = tk.StringVar(value="")
+        self.english_text = tk.StringVar(value="")
+        self.traditional_chinese_text = tk.StringVar(value="")
+        self.english_label = tk.Label(
+            self.window,
+            textvariable=self.english_text,
+            font=("Segoe UI", 12),
+            foreground="#d7d7d7",
+            background="#1d1d1d",
+            padx=22,
+            pady=(10, 2),
+        )
+        self.english_label.pack(padx=12, pady=(12, 0))
         self.label = tk.Label(
             self.window,
-            textvariable=self.text,
+            textvariable=self.traditional_chinese_text,
             font=("Microsoft JhengHei UI", 20, "bold"),
             foreground="white",
             background="#1d1d1d",
             padx=22,
-            pady=12,
+            pady=(2, 10),
         )
-        self.label.pack(padx=12, pady=12)
+        self.label.pack(padx=12, pady=(0, 12))
 
-    def show_subtitle(self, text: str) -> None:
-        """Show one line of subtitle text, replacing the current text."""
-        cleaned = " ".join(text.splitlines()).strip()
-        if not cleaned:
+    def show_subtitle(self, traditional_chinese: str, english: str = "") -> None:
+        """Show an English original with its Traditional Chinese translation."""
+        chinese_line = " ".join(traditional_chinese.splitlines()).strip()
+        english_line = " ".join(english.splitlines()).strip()
+        if not chinese_line:
             self.hide()
             return
 
-        self.text.set(cleaned)
+        self.english_text.set(english_line)
+        self.traditional_chinese_text.set(chinese_line)
+        self.english_label.pack_forget()
+        if english_line:
+            self.english_label.pack(padx=12, pady=(12, 0), before=self.label)
         self.window.deiconify()
         self.window.lift()
         self.window.update_idletasks()
@@ -69,7 +85,8 @@ class SubtitleOverlay:
         self.window.geometry(f"{width}x{height}+{x}+{y}")
 
     def hide(self) -> None:
-        self.text.set("")
+        self.english_text.set("")
+        self.traditional_chinese_text.set("")
         self.window.withdraw()
 
 
@@ -84,7 +101,7 @@ class GameTranslatorApp:
         self.is_previewing = False
         self.router: AudioRouter | None = None
         self.captioner: LiveCaptioner | None = None
-        self.live_captions: Queue[str] = Queue()
+        self.live_captions: Queue[tuple[str, str]] = Queue()
         self.input_devices: list[AudioDevice] = []
         self.output_devices: list[AudioDevice] = []
 
@@ -173,7 +190,9 @@ class GameTranslatorApp:
             self.status.set("請先選擇輸入與耳機輸出裝置")
             return
         try:
-            self.captioner = LiveCaptioner(lambda caption: self.live_captions.put(caption.traditional_chinese_text))
+            self.captioner = LiveCaptioner(
+                lambda caption: self.live_captions.put((caption.english_text, caption.traditional_chinese_text))
+            )
             self.captioner.start()
             self.router = AudioRouter(AudioRoute(capture, playback), self.captioner.submit)
             self.router.start()
@@ -206,15 +225,16 @@ class GameTranslatorApp:
     def poll_live_captions(self) -> None:
         try:
             while True:
-                self.set_subtitle_text(self.live_captions.get_nowait())
+                english, chinese = self.live_captions.get_nowait()
+                self.set_subtitle_text(chinese, english)
         except Empty:
             pass
         self.root.after(50, self.poll_live_captions)
 
-    def set_subtitle_text(self, text: str) -> None:
+    def set_subtitle_text(self, text: str, english_text: str = "") -> None:
         """Public subtitle entry point for future recognition/translation code."""
         if self.is_previewing:
-            self.root.after(0, self.overlay.show_subtitle, text)
+            self.root.after(0, self.overlay.show_subtitle, text, english_text)
 
     def close(self) -> None:
         self.overlay.window.destroy()

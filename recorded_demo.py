@@ -54,7 +54,7 @@ def process_to_preview(wavs: list[Path], model_name: str) -> int:
             while True:
                 caption = captions.get_nowait()
                 print(json.dumps(caption.to_dict(), ensure_ascii=False))
-                ui.set_subtitle_text(caption.traditional_chinese_text)
+                ui.set_subtitle_text(caption.traditional_chinese_text, caption.english_text)
         except Empty:
             pass
 

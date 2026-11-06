@@ -84,5 +84,6 @@ Selecting **開始即時音訊** now opens the selected capture and playback dev
 original audio is copied directly to the chosen headphones while English speech
 blocks are processed in a background thread for subtitles. Local models are
 preloaded before they receive speech, and live chunks are 0.75 seconds to
-reduce caption delay. This app never speaks a Chinese translation aloud. Use
-**停止預覽** to close both streams.
+reduce caption delay. The overlay shows the English original above its larger
+Traditional Chinese translation. This app never speaks a Chinese translation
+aloud. Use **停止預覽** to close both streams.
