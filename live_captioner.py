@@ -14,7 +14,7 @@ from audio_pipeline import CaptionResult, RecordedAudioPipeline
 class LiveCaptioner:
     """Groups speech into short chunks, then recognizes them off the audio thread."""
 
-    def __init__(self, on_caption: Callable[[CaptionResult], None], chunk_seconds: float = 1.5) -> None:
+    def __init__(self, on_caption: Callable[[CaptionResult], None], chunk_seconds: float = 0.75) -> None:
         self.on_caption = on_caption
         self.chunk_seconds = chunk_seconds
         self._blocks: Queue[tuple[np.ndarray, int]] = Queue(maxsize=200)
@@ -39,6 +39,8 @@ class LiveCaptioner:
             self._thread = None
 
     def _run(self) -> None:
+        # Load both local models before speech arrives. This removes the large
+        # one-time startup cost from the first spoken caption.
         pipeline = RecordedAudioPipeline()
         buffered: list[np.ndarray] = []
         sample_rate = 0
