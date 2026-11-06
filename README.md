@@ -43,15 +43,17 @@ code never accesses Tk widgets directly.
 
 ## Run the MVP 3 recorded-audio prototype
 
-This prototype uses `faster-whisper` with the CPU-friendly `base.en` model and
-MyMemory through `deep-translator` for English → Traditional Chinese. It needs
-Internet access the first time to download the Whisper model and while
-translating; no API key is used. The pipeline accepts completed WAV files so a
+This prototype uses local models only: `faster-whisper` with the CPU-friendly
+`base.en` model for English speech recognition, then Argos Translate's English
+→ Chinese model and OpenCC for Traditional Chinese conversion. Internet access
+is needed only once to download each model; later translation has no API key,
+quota or network dependency. The pipeline accepts completed WAV files so a
 future live-capture task can send audio chunks through the same code.
 
 ```powershell
 cd D:\GameTranslator
 py -m pip install -r requirements.txt
+py scripts\install_local_translation_model.py
 powershell -ExecutionPolicy Bypass -File scripts\generate_sample_audio.ps1
 py recorded_demo.py
 ```
@@ -68,3 +70,12 @@ py recorded_demo.py --preview
 The generated WAV files are created locally from Windows speech synthesis and
 are ignored by Git. Use your own authorized English WAV files by appending their
 paths to `recorded_demo.py`.
+
+## Audio routing setup (prepared for MVP 4)
+
+The main window now lists capture inputs and headphone outputs without changing
+any Windows default device. With VB-Audio Virtual Cable installed, choose
+**CABLE Output** as GameTranslator's input, set VALORANT voice-chat output to
+**CABLE Input**, then select your headphone/speaker endpoint as the output.
+Actual capture, passthrough and VALORANT validation remain deferred until the
+final hardware test.

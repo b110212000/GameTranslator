@@ -12,9 +12,10 @@ from time import perf_counter
 from typing import Callable, Iterable
 import wave
 
-from deep_translator import MyMemoryTranslator
+import argostranslate.translate
 from faster_whisper import WhisperModel
 import numpy as np
+from opencc import OpenCC
 
 
 @dataclass(frozen=True)
@@ -36,10 +37,7 @@ class RecordedAudioPipeline:
         # The first construction downloads the selected model into the user's
         # Hugging Face cache. int8 keeps the Windows CPU footprint small.
         self.model = WhisperModel(model_name, device="cpu", compute_type="int8")
-        # MyMemory's public endpoint is sufficient for the three-line MVP
-        # demo and does not need an API key. Its documented English code is
-        # en-GB, even when processing US English speech.
-        self.translator = MyMemoryTranslator(source="en-GB", target="zh-TW")
+        self.translator = LocalTraditionalChineseTranslator()
 
     def process_wav(self, wav_path: Path) -> list[CaptionResult]:
         """Recognize one completed WAV and translate each non-empty segment."""
@@ -100,3 +98,22 @@ def load_pcm_wav_as_16khz_mono(wav_path: Path) -> np.ndarray:
     target_length = round(len(audio) * 16000 / sample_rate)
     target_positions = np.linspace(0, len(audio) - 1, target_length)
     return np.interp(target_positions, source_positions, audio).astype(np.float32)
+
+
+class LocalTraditionalChineseTranslator:
+    """Offline Argos English→Chinese translation with Traditional conversion."""
+
+    def __init__(self) -> None:
+        languages = argostranslate.translate.get_installed_languages()
+        english = next((language for language in languages if language.code == "en"), None)
+        chinese = next((language for language in languages if language.code == "zh"), None)
+        if english is None or chinese is None:
+            raise RuntimeError(
+                "The local en→zh translation model is missing. Run "
+                "py scripts\\install_local_translation_model.py once while online."
+            )
+        self.translation = english.get_translation(chinese)
+        self.to_traditional = OpenCC("s2twp")
+
+    def translate(self, english_text: str) -> str:
+        return self.to_traditional.convert(self.translation.translate(english_text))

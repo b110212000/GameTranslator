@@ -10,6 +10,8 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
+from audio_devices import AudioDevice, list_input_devices, list_output_devices
+
 
 PREVIEW_SUBTITLE = "隊友正在 A 點佈防，小心右側！"
 OVERLAY_TRANSPARENT_COLOR = "#ff00ff"
@@ -77,6 +79,8 @@ class GameTranslatorApp:
         self.root.resizable(False, False)
         self.overlay = SubtitleOverlay(root)
         self.is_previewing = False
+        self.input_devices: list[AudioDevice] = []
+        self.output_devices: list[AudioDevice] = []
 
         container = ttk.Frame(root, padding=24)
         container.grid()
@@ -99,15 +103,53 @@ class GameTranslatorApp:
         self.stop_button = ttk.Button(container, text="停止預覽", command=self.stop_preview, state="disabled")
         self.stop_button.grid(row=3, column=1, sticky="ew", pady=(20, 0))
 
+        ttk.Separator(container).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(20, 12))
+        ttk.Label(container, text="語音輸入（遊戲請指定輸出到 CABLE Input）：").grid(row=5, column=0, columnspan=2, sticky="w")
+        self.input_choice = tk.StringVar()
+        self.input_select = ttk.Combobox(container, textvariable=self.input_choice, width=55, state="readonly")
+        self.input_select.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 10))
+        ttk.Label(container, text="耳機輸出（保留隊友原音）：").grid(row=7, column=0, columnspan=2, sticky="w")
+        self.output_choice = tk.StringVar()
+        self.output_select = ttk.Combobox(container, textvariable=self.output_choice, width=55, state="readonly")
+        self.output_select.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(4, 6))
+        ttk.Button(container, text="重新掃描裝置", command=self.refresh_audio_devices).grid(row=9, column=0, columnspan=2, sticky="w")
+
         ttk.Label(container, text="字幕文字入口（供後續音訊／翻譯模組呼叫）：").grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(20, 4)
+            row=10, column=0, columnspan=2, sticky="w", pady=(20, 4)
         )
         self.subtitle_input = tk.StringVar(value=PREVIEW_SUBTITLE)
         self.entry = ttk.Entry(container, textvariable=self.subtitle_input, width=38)
-        self.entry.grid(row=5, column=0, columnspan=2, sticky="ew")
+        self.entry.grid(row=11, column=0, columnspan=2, sticky="ew")
         self.entry.bind("<Return>", lambda _event: self.set_subtitle_text(self.subtitle_input.get()))
 
+        self.refresh_audio_devices()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def refresh_audio_devices(self) -> None:
+        """Populate routing selectors without changing Windows audio settings."""
+        try:
+            self.input_devices = list_input_devices()
+            self.output_devices = list_output_devices()
+        except Exception as error:
+            self.status.set(f"無法讀取音訊裝置：{error}")
+            return
+        self.input_select["values"] = [device.label for device in self.input_devices]
+        self.output_select["values"] = [device.label for device in self.output_devices]
+        if self.input_devices and not self.input_choice.get():
+            cable_input = next((device for device in self.input_devices if "CABLE Output" in device.name), self.input_devices[0])
+            self.input_choice.set(cable_input.label)
+        if self.output_devices and not self.output_choice.get():
+            self.output_choice.set(self.output_devices[0].label)
+
+    def selected_audio_device_indexes(self) -> tuple[int | None, int | None]:
+        """Return selected capture and headphone endpoint indexes for the router."""
+        return self._selected_index(self.input_choice.get()), self._selected_index(self.output_choice.get())
+
+    @staticmethod
+    def _selected_index(label: str) -> int | None:
+        if not label.startswith("[") or "]" not in label:
+            return None
+        return int(label[1 : label.index("]")])
 
     def start_preview(self) -> None:
         self.is_previewing = True
