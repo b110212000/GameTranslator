@@ -1,8 +1,4 @@
-"""Recorded-audio recognition and English-to-Traditional-Chinese translation.
-
-The public ``process_wav`` function is deliberately file/chunk based so a later
-live capture layer can pass each completed WAV chunk into the same pipeline.
-"""
+"""Local English/Japanese recognition and Traditional Chinese translation."""
 
 from __future__ import annotations
 
@@ -11,39 +7,90 @@ from pathlib import Path
 from time import perf_counter
 from typing import Callable, Iterable
 import wave
+import logging
 
 import argostranslate.package
 import ctranslate2
 from faster_whisper import WhisperModel
 import numpy as np
 from opencc import OpenCC
+from gpu_runtime import cuda_available
 
 
 @dataclass(frozen=True)
 class CaptionResult:
     source_file: str
-    english_text: str
+    source_text: str
     traditional_chinese_text: str
     segment_end_seconds: float
     processing_latency_seconds: float
+    source_language: str = "en"
+
+    @property
+    def english_text(self) -> str:
+        """Compatibility for older recorded-demo callers."""
+        return self.source_text
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
 
 class RecordedAudioPipeline:
-    """Reusable CPU-friendly English WAV pipeline for the MVP prototype."""
+    """Separate recognition and translation entry points for worker threads."""
 
-    def __init__(self, model_name: str = "base.en") -> None:
+    def __init__(self, model_name: str | None = None, language: str = "en") -> None:
+        if language not in ("en", "ja"):
+            raise ValueError("Unsupported source language")
+        self.language = language
+        self.auto_model = model_name is None
         # Installation downloads models explicitly; live translation only reads
         # the local cache. int8 keeps the Windows CPU footprint small.
-        self.model = WhisperModel(model_name, device="cpu", compute_type="int8", local_files_only=True)
-        self.translator = LocalTraditionalChineseTranslator()
+        self.device = "cuda" if cuda_available() else "cpu"
+        self.model_name = model_name or ("base.en" if language == "en" else "turbo" if self.device == "cuda" else "small")
+        try:
+            self.model = self._load_model()
+        except RuntimeError:
+            if self.device != "cuda": raise
+            logging.warning("GPU model loading failed; using CPU", exc_info=True)
+            self.device = "cpu"
+            if self.auto_model and self.language == "ja": self.model_name = "small"
+            self.model = self._load_model()
+        self.translator = LocalTraditionalChineseTranslator(language)
+
+    def _load_model(self):
+        return WhisperModel(self.model_name, device=self.device,
+                            compute_type="int8_float16" if self.device == "cuda" else "int8",
+                            cpu_threads=4, local_files_only=True)
 
     def warm_up(self) -> None:
-        self.translator.translate("Ready.")
-        segments, _ = self.model.transcribe(np.zeros(16000, dtype=np.float32), language="en")
+        self.translator.translate("Ready." if self.language == "en" else "準備ができました。")
+        try:
+            self._warm_recognition()
+        except RuntimeError:
+            if self.device != "cuda": raise
+            logging.warning("GPU warmup failed; using CPU", exc_info=True)
+            self.device = "cpu"
+            if self.auto_model and self.language == "ja": self.model_name = "small"
+            self.model = self._load_model()
+            self._warm_recognition()
+
+    def _warm_recognition(self):
+        segments, _ = self.model.transcribe(np.zeros(16000, dtype=np.float32), language=self.language,
+                                            beam_size=1, temperature=0.0)
         list(segments)
+
+    def recognize_audio(self, audio: np.ndarray, sample_rate: int) -> list[tuple[str, float]]:
+        """Return original text without waiting for translation."""
+        audio = resample_to_16khz_mono(audio, sample_rate)
+        segments, _ = self.model.transcribe(
+            audio, language=self.language, beam_size=3 if self.language == "ja" else 1, best_of=1,
+            temperature=0.0, condition_on_previous_text=False, vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 200, "speech_pad_ms": 150},
+        )
+        return [(s.text.strip(), s.end) for s in segments if s.text.strip()]
+
+    def translate(self, source_text: str) -> str:
+        return self.translator.translate(source_text)
 
     def process_wav(self, wav_path: Path) -> list[CaptionResult]:
         """Recognize one completed WAV and translate each non-empty segment."""
@@ -53,28 +100,19 @@ class RecordedAudioPipeline:
     def process_audio(self, audio: np.ndarray, sample_rate: int, source: str = "live") -> list[CaptionResult]:
         """Process a completed live audio chunk using the same caption pipeline."""
         started_at = perf_counter()
-        audio = resample_to_16khz_mono(audio, sample_rate)
-        segments, _info = self.model.transcribe(
-            audio,
-            language="en",
-            beam_size=5,
-            vad_filter=True,
-        )
         results: list[CaptionResult] = []
-        for segment in segments:
-            english = segment.text.strip()
-            if not english:
-                continue
-            translated = self.translator.translate(english)
+        for original, end in self.recognize_audio(audio, sample_rate):
+            translated = self.translate(original)
             results.append(
                 CaptionResult(
                     source_file=source,
-                    english_text=english,
+                    source_text=original,
                     traditional_chinese_text=translated,
-                    segment_end_seconds=round(segment.end, 3),
+                    segment_end_seconds=round(end, 3),
                     # For this recorded-audio prototype, processing starts
                     # immediately after a completed WAV chunk is available.
                     processing_latency_seconds=round(perf_counter() - started_at, 3),
+                    source_language=self.language,
                 )
             )
         return results
@@ -123,32 +161,35 @@ def resample_to_16khz_mono(audio: np.ndarray, sample_rate: int) -> np.ndarray:
 
 
 class LocalTraditionalChineseTranslator:
-    """Offline Argos English→Chinese translation with Traditional conversion."""
+    """Local direct translation, or Japanese→English→Chinese when needed."""
 
-    def __init__(self) -> None:
-        self.package = next((p for p in argostranslate.package.get_installed_packages()
-                             if p.from_code == "en" and p.to_code == "zh"), None)
-        if self.package is None:
-            raise RuntimeError(
-                "The local en→zh translation model is missing. Run "
-                "py scripts\\install_local_translation_model.py once while online."
-            )
-        self.translation = ctranslate2.Translator(str(self.package.package_path / "model"),
-                                                  device="cpu", compute_type="int8", intra_threads=4)
+    def __init__(self, language: str = "en") -> None:
+        installed = {(p.from_code, p.to_code): p for p in argostranslate.package.get_installed_packages()}
+        pairs = [(language, "zh")] if language == "en" or (language, "zh") in installed else [(language, "en"), ("en", "zh")]
+        self.steps = []
+        for pair in pairs:
+            package = installed.get(pair)
+            if package is None:
+                raise RuntimeError(f"缺少本機翻譯模型 {pair[0]}→{pair[1]}，請執行 scripts\\install_local_translation_model.py")
+            translator = ctranslate2.Translator(str(package.package_path / "model"),
+                                                device="cpu", compute_type="int8", intra_threads=2)
+            self.steps.append((package, translator))
         self.to_traditional = OpenCC("s2twp")
 
-    def translate(self, english_text: str) -> str:
+    def translate(self, source_text: str) -> str:
         # Whisper already emits short sentence-like segments. Direct inference
         # avoids Stanza's implicit resource download during sentence splitting.
-        if not english_text.strip():
+        if not source_text.strip():
             return ""
-        prefix = self.package.target_prefix
-        output = self.translation.translate_batch(
-            [self.package.tokenizer.encode(english_text)],
-            target_prefix=[[prefix]] if prefix else None,
-            beam_size=4, replace_unknowns=True, length_penalty=0.2,
-        )[0]
-        translated = self.package.tokenizer.decode(output.hypotheses[0])
-        if prefix and translated.startswith(prefix):
-            translated = translated[len(prefix):]
+        translated = source_text
+        for package, translator in self.steps:
+            prefix = package.target_prefix
+            output = translator.translate_batch(
+                [package.tokenizer.encode(translated)],
+                target_prefix=[[prefix]] if prefix else None,
+                beam_size=2, replace_unknowns=True, length_penalty=0.2,
+            )[0]
+            translated = package.tokenizer.decode(output.hypotheses[0]).strip()
+            if prefix and translated.startswith(prefix):
+                translated = translated[len(prefix):]
         return self.to_traditional.convert(translated.strip())

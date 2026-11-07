@@ -50,9 +50,10 @@ def read_settings() -> dict:
         return {}
 
 
-def save_settings(capture: AudioDevice, playback: AudioDevice) -> None:
+def save_settings(capture: AudioDevice, playback: AudioDevice, language: str = "en") -> None:
     payload = {"capture": {"name": capture.name, "host_api": capture.host_api},
-               "playback": {"name": playback.name, "host_api": playback.host_api}}
+               "playback": {"name": playback.name, "host_api": playback.host_api},
+               "language": language}
     temp = SETTINGS_PATH.with_suffix(".tmp")
     temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temp.replace(SETTINGS_PATH)

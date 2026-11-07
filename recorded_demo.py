@@ -23,18 +23,19 @@ DEFAULT_WAVS = (
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Recognize English WAV files and display Traditional Chinese captions.")
     parser.add_argument("wav", nargs="*", type=Path, help="Completed English WAV files to process in order.")
-    parser.add_argument("--model", default="base.en", help="faster-whisper model name (default: base.en).")
+    parser.add_argument("--model", default=None, help="Override the language's local speech model.")
+    parser.add_argument("--language", choices=("en", "ja"), default="en")
     parser.add_argument("--preview", action="store_true", help="Show captions in the GameTranslator preview window.")
     return parser.parse_args(argv)
 
 
-def process_to_console(wavs: list[Path], model_name: str) -> int:
-    pipeline = RecordedAudioPipeline(model_name)
+def process_to_console(wavs: list[Path], model_name: str | None, language: str = "en") -> int:
+    pipeline = RecordedAudioPipeline(model_name, language=language)
     pipeline.process_paths(wavs, lambda caption: print(json.dumps(caption.to_dict(), ensure_ascii=False)))
     return 0
 
 
-def process_to_preview(wavs: list[Path], model_name: str) -> int:
+def process_to_preview(wavs: list[Path], model_name: str | None, language: str = "en") -> int:
     import tkinter as tk
 
     root = tk.Tk()
@@ -45,7 +46,7 @@ def process_to_preview(wavs: list[Path], model_name: str) -> int:
 
     def worker() -> None:
         try:
-            RecordedAudioPipeline(model_name).process_paths(wavs, captions.put)
+            RecordedAudioPipeline(model_name, language=language).process_paths(wavs, captions.put)
         except Exception as error:  # surfaced in the window status and console
             errors.put(error)
 
@@ -78,7 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     missing = [str(path) for path in wavs if not path.is_file()]
     if missing:
         raise SystemExit("Missing WAV file(s): " + ", ".join(missing) + ". Run scripts\\generate_sample_audio.ps1 first.")
-    return process_to_preview(wavs, args.model) if args.preview else process_to_console(wavs, args.model)
+    return process_to_preview(wavs, args.model, args.language) if args.preview else process_to_console(wavs, args.model, args.language)
 
 
 if __name__ == "__main__":
