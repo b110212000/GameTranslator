@@ -32,7 +32,10 @@ class AudioRouter:
     def __init__(self, route: AudioRoute, on_audio: AudioBlockHandler | None = None) -> None:
         self.route = route
         self.on_audio = on_audio
-        self._playback_blocks: Queue[np.ndarray] = Queue(maxsize=100)
+        self._playback_blocks: Queue[np.ndarray] = Queue(maxsize=10)
+        self.level = 0.0
+        self.captured_frames = 0
+        self.played_frames = 0
         self._input_stream: sd.InputStream | None = None
         self._output_stream: sd.OutputStream | None = None
 
@@ -50,30 +53,40 @@ class AudioRouter:
             dtype="float32",
             latency="low",
         )
-        self._output_stream = sd.OutputStream(
-            device=self.route.playback_device,
-            callback=self._playback_callback,
-            **stream_args,
-        )
-        self._input_stream = sd.InputStream(
-            device=self.route.capture_device,
-            callback=self._capture_callback,
-            **stream_args,
-        )
-        self._output_stream.start()
-        self._input_stream.start()
+        capture = sd.query_devices(self.route.capture_device)
+        playback = sd.query_devices(self.route.playback_device)
+        if "CABLE Input" in playback["name"]:
+            raise ValueError("耳機輸出不可選 CABLE Input，否則會形成音訊迴路。")
+        self._capture_channels = min(2, capture["max_input_channels"])
+        self._playback_channels = min(2, playback["max_output_channels"])
+        try:
+            stream_args["channels"] = self._playback_channels
+            self._output_stream = sd.OutputStream(device=self.route.playback_device,
+                callback=self._playback_callback, **stream_args)
+            stream_args["channels"] = self._capture_channels
+            self._input_stream = sd.InputStream(device=self.route.capture_device,
+                callback=self._capture_callback, **stream_args)
+            self._output_stream.start()
+            self._input_stream.start()
+        except Exception:
+            self.stop()
+            raise
 
     def stop(self) -> None:
         for stream in (self._input_stream, self._output_stream):
             if stream is not None:
-                stream.stop()
-                stream.close()
+                try:
+                    stream.abort()
+                finally:
+                    stream.close()
         self._input_stream = None
         self._output_stream = None
         self._drain_playback_queue()
 
     def _capture_callback(self, indata: np.ndarray, _frames: int, _time: object, _status: sd.CallbackFlags) -> None:
         block = indata.copy()
+        self.level = float(np.sqrt(np.mean(np.square(block))))
+        self.captured_frames += len(block)
         try:
             self._playback_blocks.put_nowait(block)
         except Full:
@@ -88,7 +101,11 @@ class AudioRouter:
 
     def _playback_callback(self, outdata: np.ndarray, _frames: int, _time: object, _status: sd.CallbackFlags) -> None:
         try:
-            outdata[:] = self._playback_blocks.get_nowait()
+            block = self._playback_blocks.get_nowait()
+            if block.shape[1] > outdata.shape[1]:
+                block = block.mean(axis=1, keepdims=True)
+            outdata[:] = block
+            self.played_frames += len(block)
         except Empty:
             outdata.fill(0)
 

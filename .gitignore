@@ -38,3 +38,7 @@ Thumbs.db
 # Locally generated test recordings and model cache
 samples/*.wav
 .cache/
+settings.json
+settings.tmp
+work/
+*.log

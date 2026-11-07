@@ -12,7 +12,8 @@ from time import perf_counter
 from typing import Callable, Iterable
 import wave
 
-import argostranslate.translate
+import argostranslate.package
+import ctranslate2
 from faster_whisper import WhisperModel
 import numpy as np
 from opencc import OpenCC
@@ -34,10 +35,15 @@ class RecordedAudioPipeline:
     """Reusable CPU-friendly English WAV pipeline for the MVP prototype."""
 
     def __init__(self, model_name: str = "base.en") -> None:
-        # The first construction downloads the selected model into the user's
-        # Hugging Face cache. int8 keeps the Windows CPU footprint small.
-        self.model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        # Installation downloads models explicitly; live translation only reads
+        # the local cache. int8 keeps the Windows CPU footprint small.
+        self.model = WhisperModel(model_name, device="cpu", compute_type="int8", local_files_only=True)
         self.translator = LocalTraditionalChineseTranslator()
+
+    def warm_up(self) -> None:
+        self.translator.translate("Ready.")
+        segments, _ = self.model.transcribe(np.zeros(16000, dtype=np.float32), language="en")
+        list(segments)
 
     def process_wav(self, wav_path: Path) -> list[CaptionResult]:
         """Recognize one completed WAV and translate each non-empty segment."""
@@ -120,16 +126,29 @@ class LocalTraditionalChineseTranslator:
     """Offline Argos English→Chinese translation with Traditional conversion."""
 
     def __init__(self) -> None:
-        languages = argostranslate.translate.get_installed_languages()
-        english = next((language for language in languages if language.code == "en"), None)
-        chinese = next((language for language in languages if language.code == "zh"), None)
-        if english is None or chinese is None:
+        self.package = next((p for p in argostranslate.package.get_installed_packages()
+                             if p.from_code == "en" and p.to_code == "zh"), None)
+        if self.package is None:
             raise RuntimeError(
                 "The local en→zh translation model is missing. Run "
                 "py scripts\\install_local_translation_model.py once while online."
             )
-        self.translation = english.get_translation(chinese)
+        self.translation = ctranslate2.Translator(str(self.package.package_path / "model"),
+                                                  device="cpu", compute_type="int8", intra_threads=4)
         self.to_traditional = OpenCC("s2twp")
 
     def translate(self, english_text: str) -> str:
-        return self.to_traditional.convert(self.translation.translate(english_text))
+        # Whisper already emits short sentence-like segments. Direct inference
+        # avoids Stanza's implicit resource download during sentence splitting.
+        if not english_text.strip():
+            return ""
+        prefix = self.package.target_prefix
+        output = self.translation.translate_batch(
+            [self.package.tokenizer.encode(english_text)],
+            target_prefix=[[prefix]] if prefix else None,
+            beam_size=4, replace_unknowns=True, length_penalty=0.2,
+        )[0]
+        translated = self.package.tokenizer.decode(output.hypotheses[0])
+        if prefix and translated.startswith(prefix):
+            translated = translated[len(prefix):]
+        return self.to_traditional.convert(translated.strip())
