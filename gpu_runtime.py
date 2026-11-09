@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 _dll_handles = []
+_dll_folders = set()
 
 
 def cuda_available() -> bool:
@@ -15,8 +16,9 @@ def cuda_available() -> bool:
     root = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
     folders = [root / "runtime" / "nvidia" / package / "bin" for package in ("cublas", "cudnn")]
     for folder in folders:
-        if folder.is_dir():
+        if folder.is_dir() and str(folder) not in _dll_folders:
             _dll_handles.append(os.add_dll_directory(str(folder)))
+            _dll_folders.add(str(folder))
             if str(folder) not in os.environ.get("PATH", "").split(os.pathsep):
                 os.environ["PATH"] = str(folder) + os.pathsep + os.environ.get("PATH", "")
     try:

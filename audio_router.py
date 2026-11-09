@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from typing import Callable
+from time import perf_counter
+import logging
 
 import numpy as np
 import sounddevice as sd
@@ -36,12 +38,19 @@ class AudioRouter:
         self.level = 0.0
         self.captured_frames = 0
         self.played_frames = 0
+        self.last_capture_at = 0.0
+        self.input_overflows = 0
+        self.output_underflows = 0
+        self.playback_drops = 0
         self._input_stream: sd.InputStream | None = None
         self._output_stream: sd.OutputStream | None = None
 
     @property
     def is_running(self) -> bool:
-        return self._input_stream is not None and self._input_stream.active
+        try:
+            return bool(self._input_stream and self._output_stream and self._input_stream.active and self._output_stream.active)
+        except (sd.PortAudioError,RuntimeError):
+            return False
 
     def start(self) -> None:
         if self.is_running:
@@ -75,21 +84,24 @@ class AudioRouter:
     def stop(self) -> None:
         for stream in (self._input_stream, self._output_stream):
             if stream is not None:
-                try:
-                    stream.abort()
-                finally:
-                    stream.close()
+                try: stream.abort()
+                except Exception: logging.exception('Audio stream abort failed')
+                try: stream.close()
+                except Exception: logging.exception('Audio stream close failed')
         self._input_stream = None
         self._output_stream = None
         self._drain_playback_queue()
 
     def _capture_callback(self, indata: np.ndarray, _frames: int, _time: object, _status: sd.CallbackFlags) -> None:
+        self.last_capture_at = perf_counter()
+        if _status.input_overflow: self.input_overflows += 1
         block = indata.copy()
         self.level = float(np.sqrt(np.mean(np.square(block))))
         self.captured_frames += len(block)
         try:
             self._playback_blocks.put_nowait(block)
         except Full:
+            self.playback_drops += 1
             # Prefer fresh audio over increasing delay if output momentarily stalls.
             try:
                 self._playback_blocks.get_nowait()
@@ -100,6 +112,7 @@ class AudioRouter:
             self.on_audio(block, self.route.sample_rate)
 
     def _playback_callback(self, outdata: np.ndarray, _frames: int, _time: object, _status: sd.CallbackFlags) -> None:
+        if _status.output_underflow: self.output_underflows += 1
         try:
             block = self._playback_blocks.get_nowait()
             if block.shape[1] > outdata.shape[1]:

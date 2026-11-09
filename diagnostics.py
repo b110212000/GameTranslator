@@ -11,6 +11,61 @@ import sounddevice as sd
 from version import __version__
 
 
+def headless_test(wav: Path, report: Path, language='en', translation='auto'):
+    """Exercise the packaged pipeline twice without windows or audible playback."""
+    from live_captioner import LiveCaptioner
+    from captions import CaptionStore, CaptionUpdate
+    from audio_pipeline import RecordedAudioPipeline, load_pcm_wav_as_16khz_mono
+    result={'version':__version__,'passed':False,'language':language,'cycles':[],
+            'mode':'silent PCM replay; no UI or physical audio endpoint validation'}
+    original_connect=socket.socket.connect
+    def offline(*args,**kwargs): raise RuntimeError('Network disabled during offline self-test')
+    socket.socket.connect=offline
+    try:
+        audio=load_pcm_wav_as_16khz_mono(wav)
+        audio=np.concatenate([audio,np.zeros(16000,dtype=np.float32)])
+        for cycle in range(2):
+            observations=[];errors=[];started=0
+            def receive(value): observations.append({'at':time.monotonic()-started,**asdict(value)})
+            engine=LiveCaptioner(receive,errors.append,language=language,
+                pipeline_factory=lambda:RecordedAudioPipeline(language=language,translation=translation))
+            try:
+                engine.start();assert engine.ready.wait(90),errors
+                started=time.monotonic()
+                for offset in range(0,len(audio),320):
+                    time.sleep(max(0,started+offset/16000-time.monotonic()))
+                    engine.submit(audio[offset:offset+320],16000)
+                deadline=time.monotonic()+15
+                while time.monotonic()<deadline:
+                    finals={(r['segment_id'],r['revision']) for r in observations if r['state']=='recognized'}
+                    done={(r['segment_id'],r['revision']) for r in observations if r['state'] in ('translated','skipped','error')}
+                    if finals and finals<=done: break
+                    time.sleep(.02)
+                source=next((r['at'] for r in observations if r['state'] in ('partial','recognized')),None)
+                target=next((r['at'] for r in observations if r['state']=='translated'),None)
+                row={'cycle':cycle+1,'backend':engine.backend,'translation_route':engine.translation_route,
+                     'first_source_seconds':source,'first_translation_seconds':target,'observations':observations}
+                result['cycles'].append(row)
+                assert not errors,errors
+                assert source is not None and target is not None and source<target,row
+                assert any(r['state']=='translated' and r['is_final'] for r in observations),row
+                store=CaptionStore(limit=6)
+                for r in observations: store.apply(CaptionUpdate(**{k:v for k,v in r.items() if k!='at'}))
+                assert list(store.rows)==sorted(store.rows),row
+            finally:
+                engine.stop()
+                if engine._thread: engine._thread.join(timeout=30)
+                assert not engine.is_alive,'Native model workers did not stop'
+        result['passed']=True
+    except Exception:
+        result['error']=traceback.format_exc()
+        raise
+    finally:
+        socket.socket.connect=original_connect
+        report.parent.mkdir(parents=True,exist_ok=True)
+        report.write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+
+
 def self_test(wav: Path, report: Path, language="en"):
     result = {"version": __version__, "language": language, "passed": False, "cycles": []}
     root = None
@@ -54,6 +109,8 @@ def self_test(wav: Path, report: Path, language="en"):
                     raise RuntimeError(ui.status.get())
                 time.sleep(0.01)
             assert ui.captioner and ui.captioner.ready.is_set(), ui.status.get()
+            from windows_overlay import REQUIRED_STYLE
+            assert ui.overlay.passive.flags() & REQUIRED_STYLE == REQUIRED_STYLE
             observations, seen = [], set()
             first_source = first_chinese = None
             source_only_visible = False
@@ -100,7 +157,11 @@ def self_test(wav: Path, report: Path, language="en"):
                 assert any(any('\u3040' <= ch <= '\u30ff' for ch in r.source_text) for r in rows), row
             sd.stop()
             ui.stop_preview()
-            root.update()
+            deadline=time.monotonic()+15
+            while time.monotonic()<deadline:
+                root.update()
+                if str(ui.live_button.cget('state'))=='normal': break
+                time.sleep(0.02)
             assert str(ui.live_button.cget("state")) == "normal"
             assert str(ui.language_select.cget("state")) == "readonly"
             assert not ui.overlay.window.winfo_ismapped()

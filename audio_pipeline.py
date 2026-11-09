@@ -8,6 +8,7 @@ from time import perf_counter
 from typing import Callable, Iterable
 import wave
 import logging
+from functools import lru_cache
 
 import argostranslate.package
 import ctranslate2
@@ -38,52 +39,82 @@ class CaptionResult:
 class RecordedAudioPipeline:
     """Separate recognition and translation entry points for worker threads."""
 
-    def __init__(self, model_name: str | None = None, language: str = "en") -> None:
-        if language not in ("en", "ja"):
+    def __init__(self, model_name: str | None = None, language: str = "en",
+                 translation: str = 'auto', device: str = 'auto') -> None:
+        if language not in ("en", "ja", "mixed"):
             raise ValueError("Unsupported source language")
         self.language = language
         self.auto_model = model_name is None
+        self.fallbacks = 0
         # Installation downloads models explicitly; live translation only reads
         # the local cache. int8 keeps the Windows CPU footprint small.
-        self.device = "cuda" if cuda_available() else "cpu"
+        self.device = "cuda" if device != 'cpu' and cuda_available() else "cpu"
         self.model_name = model_name or ("base.en" if language == "en" else "turbo" if self.device == "cuda" else "small")
         try:
             self.model = self._load_model()
         except RuntimeError:
             if self.device != "cuda": raise
             logging.warning("GPU model loading failed; using CPU", exc_info=True)
-            self.device = "cpu"
-            if self.auto_model and self.language == "ja": self.model_name = "small"
-            self.model = self._load_model()
-        self.translator = LocalTraditionalChineseTranslator(language)
+            self._fallback_to_cpu()
+        # Keep the faster Argos route as the default. Direct NLLB is opt-in:
+        # our local phrase comparison does not show consistently better quality.
+        if language=='mixed':
+            from mixed_translation import MixedChineseEnglishTranslator
+            self.translator = MixedChineseEnglishTranslator()
+        elif language=='ja' and translation=='direct':
+            from direct_translation import DirectJapaneseTranslator
+            self.translator = DirectJapaneseTranslator()
+        else:
+            self.translator = LocalTraditionalChineseTranslator(language)
+        self.translation_route = getattr(self.translator,'route','Argos 本機翻譯')
+
+    def _fallback_to_cpu(self):
+        self.model = None  # Release the GPU model before allocating a replacement.
+        self.device = 'cpu'
+        self.fallbacks += 1
+        if self.auto_model and self.language in ('ja','mixed'): self.model_name='small'
+        self.model = self._load_model()
 
     def _load_model(self):
-        return WhisperModel(self.model_name, device=self.device,
+        from model_catalog import MODELS, local_model_path
+        path = local_model_path(self.model_name) if self.model_name in MODELS else Path(self.model_name)
+        if path is None:
+            raise RuntimeError(f'尚未安裝 {MODELS[self.model_name].name}，請開啟「模型管理」下載。')
+        return WhisperModel(str(path), device=self.device,
                             compute_type="int8_float16" if self.device == "cuda" else "int8",
                             cpu_threads=4, local_files_only=True)
 
     def warm_up(self) -> None:
-        self.translator.translate("Ready." if self.language == "en" else "準備ができました。")
+        self.translator.translate("準備ができました。" if self.language == "ja" else "Ready.")
         try:
             self._warm_recognition()
         except RuntimeError:
             if self.device != "cuda": raise
             logging.warning("GPU warmup failed; using CPU", exc_info=True)
-            self.device = "cpu"
-            if self.auto_model and self.language == "ja": self.model_name = "small"
-            self.model = self._load_model()
+            self._fallback_to_cpu()
             self._warm_recognition()
 
     def _warm_recognition(self):
-        segments, _ = self.model.transcribe(np.zeros(16000, dtype=np.float32), language=self.language,
+        segments, _ = self.model.transcribe(np.zeros(16000, dtype=np.float32),
+                                            language=None if self.language=='mixed' else self.language,
                                             beam_size=1, temperature=0.0)
         list(segments)
 
     def recognize_audio(self, audio: np.ndarray, sample_rate: int) -> list[tuple[str, float]]:
         """Return original text without waiting for translation."""
         audio = resample_to_16khz_mono(audio, sample_rate)
+        try:
+            return self._recognize(audio)
+        except RuntimeError:
+            if self.device != 'cuda': raise
+            logging.warning('GPU recognition failed; continuing on CPU',exc_info=True)
+            self._fallback_to_cpu()
+            return self._recognize(audio)
+
+    def _recognize(self,audio):
         segments, _ = self.model.transcribe(
-            audio, language=self.language, beam_size=3 if self.language == "ja" else 1, best_of=1,
+            audio, language=None if self.language=='mixed' else self.language,
+            beam_size=3 if self.language in ('ja','mixed') else 1, best_of=1,
             temperature=0.0, condition_on_previous_text=False, vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 200, "speech_pad_ms": 150},
         )
@@ -91,6 +122,14 @@ class RecordedAudioPipeline:
 
     def translate(self, source_text: str) -> str:
         return self.translator.translate(source_text)
+
+    def close(self):
+        """Release native models before Python/Windows tears down worker DLLs."""
+        if self.model is not None:
+            self.model.model.unload_model()
+            self.model = None
+        close = getattr(self.translator, 'close', None)
+        if close: close()
 
     def process_wav(self, wav_path: Path) -> list[CaptionResult]:
         """Recognize one completed WAV and translate each non-empty segment."""
@@ -164,19 +203,22 @@ class LocalTraditionalChineseTranslator:
     """Local direct translation, or Japanese→English→Chinese when needed."""
 
     def __init__(self, language: str = "en") -> None:
-        installed = {(p.from_code, p.to_code): p for p in argostranslate.package.get_installed_packages()}
+        from model_catalog import installed_translation_packages
+        installed = {(p.from_code, p.to_code): p for p in installed_translation_packages()}
         pairs = [(language, "zh")] if language == "en" or (language, "zh") in installed else [(language, "en"), ("en", "zh")]
         self.steps = []
         for pair in pairs:
             package = installed.get(pair)
             if package is None:
-                raise RuntimeError(f"缺少本機翻譯模型 {pair[0]}→{pair[1]}，請執行 scripts\\install_local_translation_model.py")
+                raise RuntimeError(f"缺少本機翻譯模型 {pair[0]}→{pair[1]}，請在「模型管理」下載對應的 Argos 模型。")
             translator = ctranslate2.Translator(str(package.package_path / "model"),
                                                 device="cpu", compute_type="int8", intra_threads=2)
             self.steps.append((package, translator))
         self.to_traditional = OpenCC("s2twp")
+        self.route = '日文→英文→繁中' if language=='ja' and len(pairs)>1 else 'Argos 本機翻譯'
+        self.translate = lru_cache(maxsize=128)(self._translate)
 
-    def translate(self, source_text: str) -> str:
+    def _translate(self, source_text: str) -> str:
         # Whisper already emits short sentence-like segments. Direct inference
         # avoids Stanza's implicit resource download during sentence splitting.
         if not source_text.strip():
@@ -193,3 +235,8 @@ class LocalTraditionalChineseTranslator:
             if prefix and translated.startswith(prefix):
                 translated = translated[len(prefix):]
         return self.to_traditional.convert(translated.strip())
+
+    def close(self):
+        self.translate.cache_clear()
+        for _, model in self.steps: model.unload_model()
+        self.steps.clear()

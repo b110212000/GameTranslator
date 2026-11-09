@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk
-from queue import Empty, Queue
+from queue import Empty, Queue, Full
+from time import perf_counter
 
-from audio_devices import AudioDevice, list_input_devices, list_output_devices, read_settings, save_settings, choose_device
+from audio_devices import AudioDevice, list_input_devices, list_output_devices, read_settings, save_settings, choose_device, update_settings
 from version import __version__
 import logging
 from pathlib import Path
@@ -18,116 +19,12 @@ import sys
 from audio_router import AudioRoute, AudioRouter
 from live_captioner import LiveCaptioner
 from captions import CaptionStore, translation_line
+from subtitle_overlay import SubtitleOverlay
 
 
-PREVIEW_SUBTITLE = "隊友正在 A 點佈防，小心右側！"
-OVERLAY_TRANSPARENT_COLOR = "#ff00ff"
-LANGUAGES = {"英文": "en", "日文": "ja"}
-
-
-class SubtitleOverlay:
-    """A bilingual, borderless, always-on-top subtitle window."""
-
-    def __init__(self, root: tk.Tk) -> None:
-        self.window = tk.Toplevel(root)
-        self.window.withdraw()
-        self.window.overrideredirect(True)
-        self.window.attributes("-topmost", True)
-        self.window.configure(background=OVERLAY_TRANSPARENT_COLOR)
-        self.wrap_width = min(850, root.winfo_screenwidth() - 100)
-
-        # Windows supports a colour-key transparency region.  If a different
-        # Tk backend does not, the readable dark subtitle panel still works.
-        try:
-            self.window.attributes("-transparentcolor", OVERLAY_TRANSPARENT_COLOR)
-        except tk.TclError:
-            pass
-
-        self.english_text = tk.StringVar(value="")
-        self.traditional_chinese_text = tk.StringVar(value="")
-        self.english_label = tk.Label(
-            self.window,
-            textvariable=self.english_text,
-            font=("Segoe UI", 12),
-            foreground="#d7d7d7",
-            background="#1d1d1d",
-            padx=22,
-            pady=2,
-        )
-        self.english_label.pack(padx=12, pady=(12, 0))
-        self.label = tk.Label(
-            self.window,
-            textvariable=self.traditional_chinese_text,
-            font=("Microsoft JhengHei UI", 20, "bold"),
-            foreground="white",
-            background="#1d1d1d",
-            padx=22,
-            pady=10,
-        )
-        self.label.pack(padx=12, pady=(0, 12))
-        self.segment_frames = []
-
-    def _clear_segments(self):
-        for frame in self.segment_frames:
-            frame.destroy()
-        self.segment_frames.clear()
-
-    def _position(self):
-        self.window.deiconify()
-        self.window.lift()
-        self.window.update_idletasks()
-        width, height = self.window.winfo_reqwidth(), self.window.winfo_reqheight()
-        x = max(0, (self.window.winfo_screenwidth() - width) // 2)
-        y = max(0, self.window.winfo_screenheight() - height - 100)
-        self.window.geometry(f"{width}x{height}+{x}+{y}")
-
-    def show_rows(self, rows):
-        """Render the last three ordered segments; translations retain their row."""
-        self._clear_segments()
-        self.english_label.pack_forget()
-        self.label.pack_forget()
-        visible = list(rows)[-3:]
-        if not visible:
-            return
-        self.english_text.set(visible[-1].source_text)
-        self.traditional_chinese_text.set(visible[-1].traditional_chinese_text)
-        for row in visible:
-            frame = tk.Frame(self.window, background="#1d1d1d", padx=16, pady=5)
-            frame.pack(fill="x", padx=12, pady=3)
-            self.segment_frames.append(frame)
-            tk.Label(frame, text=row.source_text, foreground="#d7d7d7", background="#1d1d1d",
-                     font=("Microsoft JhengHei UI", 12), wraplength=self.wrap_width, justify="left",
-                     anchor="w").pack(fill="x")
-            translated = bool(row.traditional_chinese_text)
-            tk.Label(frame, text=translation_line(row), background="#1d1d1d",
-                     foreground="white" if translated else "#91a4bc",
-                     font=("Microsoft JhengHei UI", 18 if translated else 11),
-                     wraplength=self.wrap_width, justify="left", anchor="w").pack(fill="x")
-        self._position()
-
-    def show_subtitle(self, traditional_chinese: str, english: str = "") -> None:
-        """Show an English original with its Traditional Chinese translation."""
-        chinese_line = " ".join(traditional_chinese.splitlines()).strip()
-        english_line = " ".join(english.splitlines()).strip()
-        if not chinese_line:
-            self.hide()
-            return
-
-        self.english_text.set(english_line)
-        self.traditional_chinese_text.set(chinese_line)
-        self._clear_segments()
-        self.label.pack_forget()
-        self.label.pack(padx=12, pady=(0, 12))
-        self.english_label.pack_forget()
-        if english_line:
-            self.english_label.pack(padx=12, pady=(12, 0), before=self.label)
-        self._position()
-
-    def hide(self) -> None:
-        self._clear_segments()
-        self.english_text.set("")
-        self.traditional_chinese_text.set("")
-        self.window.withdraw()
+PREVIEW_SUBTITLE = "字幕預覽：原文先顯示，翻譯隨後補上。"
+LANGUAGES = {"中英混合（建議）": "mixed", "純英文": "en", "日文": "ja"}
+LANGUAGE_NAMES = {'mixed':'中／英文','en':'英文','ja':'日文'}
 
 
 class GameTranslatorApp:
@@ -137,13 +34,18 @@ class GameTranslatorApp:
         self.root = root
         self.root.title(f"GameTranslator v{__version__}")
         self.root.resizable(False, False)
-        self.overlay = SubtitleOverlay(root)
+        self.settings = read_settings()
+        self.overlay = SubtitleOverlay(root, self.settings.get("subtitle_position"),
+                                       self.save_subtitle_position, self.position_editing_changed)
         self.is_previewing = False
         self.router: AudioRouter | None = None
         self.captioner: LiveCaptioner | None = None
-        self.events = Queue()
+        self.events = Queue(maxsize=256)
+        self.retiring = []
+        self.model_manager = None
+        self.started_at = 0
+        self.last_sound_at = 0
         self.generation = 0
-        self.settings = read_settings()
         self.caption_store = CaptionStore(limit=6)
         self.closed = False
         self.input_devices: list[AudioDevice] = []
@@ -155,7 +57,7 @@ class GameTranslatorApp:
         ttk.Label(container, text=f"GameTranslator v{__version__}", font=("Microsoft JhengHei UI", 18, "bold")).grid(
             row=0, column=0, columnspan=2, sticky="w"
         )
-        ttk.Label(container, text="英文／日文 → 繁中｜原文先出・翻譯隨後補上", foreground="#555555").grid(
+        ttk.Label(container, text="中英混合／日文 → 繁中｜原文先出・翻譯隨後補上", foreground="#555555").grid(
             row=1, column=0, columnspan=2, sticky="w", pady=(4, 18)
         )
 
@@ -184,36 +86,90 @@ class GameTranslatorApp:
         self.live_button = ttk.Button(container, text="開始即時音訊", command=self.start_live_audio)
         self.live_button.grid(row=9, column=1, sticky="e")
 
-        ttk.Label(container, text="字幕預覽文字：").grid(
+        ttk.Label(container, text="字幕預覽文字（單行透明字幕，更新後 3 秒隱藏）：").grid(
             row=10, column=0, columnspan=2, sticky="w", pady=(20, 4)
         )
         self.subtitle_input = tk.StringVar(value=PREVIEW_SUBTITLE)
         self.entry = ttk.Entry(container, textvariable=self.subtitle_input, width=38)
-        self.entry.grid(row=11, column=0, columnspan=2, sticky="ew")
+        self.entry.grid(row=11, column=0, sticky="ew", padx=(0, 8))
         self.entry.bind("<Return>", lambda _event: self.set_subtitle_text(self.subtitle_input.get()))
+        position_controls = ttk.Frame(container)
+        position_controls.grid(row=11, column=1, sticky="e")
+        self.position_button = ttk.Button(position_controls, text="調整字幕位置", command=self.toggle_positioning)
+        self.position_button.pack(side="left")
+        ttk.Button(position_controls, text="重設位置", command=self.overlay.reset_position).pack(side="left", padx=(6, 0))
 
         self.level = tk.DoubleVar(value=0)
         ttk.Progressbar(container, variable=self.level, maximum=100).grid(row=12, column=0, columnspan=2, sticky="ew", pady=(16, 4))
         self.signal = tk.StringVar(value="輸入音量｜尚未開始")
         ttk.Label(container, textvariable=self.signal).grid(row=13, column=0, columnspan=2, sticky="w")
         ttk.Label(container, text="語音語言：").grid(row=14, column=0, sticky="w", pady=(12, 4))
-        saved_language = self.settings.get("language", "en")
-        self.language_choice = tk.StringVar(value=next((k for k,v in LANGUAGES.items() if v == saved_language), "英文"))
-        self.language_select = ttk.Combobox(container, textvariable=self.language_choice,
+        saved_language = self.settings.get("language", "mixed")
+        self.language_choice = tk.StringVar(value=next((k for k,v in LANGUAGES.items() if v == saved_language), "中英混合（建議）"))
+        language_controls = ttk.Frame(container)
+        language_controls.grid(row=14,column=1,sticky='w',pady=(12,4))
+        self.language_select = ttk.Combobox(language_controls, textvariable=self.language_choice,
                                            values=list(LANGUAGES), state="readonly", width=16)
-        self.language_select.grid(row=14, column=1, sticky="w", pady=(12, 4))
+        self.language_select.pack(side='left')
+        ttk.Button(language_controls,text='模型管理',command=self.open_model_manager).pack(side='left',padx=(8,0))
+        from help_viewer import open_help
+        ttk.Button(language_controls,text='使用教學',command=lambda:open_help(self.root)).pack(side='left',padx=(6,0))
         self.language_select.bind("<<ComboboxSelected>>", self.save_audio_selection)
         ttk.Label(container, text="最近字幕｜原文持續更新，中文補在同一段下方").grid(
             row=15, column=0, columnspan=2, sticky="w", pady=(10, 4))
         self.history = tk.Text(container, width=60, height=8, wrap="word", state="disabled",
                                font=("Microsoft JhengHei UI", 10), background="#f7f7f7", relief="flat")
         self.history.grid(row=16, column=0, columnspan=2, sticky="ew")
+        self.health = tk.StringVar(value='夾雜中文請選「中英混合」，中文會保留並轉成繁體。')
+        ttk.Label(container,textvariable=self.health,wraplength=500,foreground='#555555').grid(
+            row=17,column=0,columnspan=2,sticky='w',pady=(8,0))
+        ttk.Label(container, text='遊戲內字幕請使用「視窗化全螢幕／無邊框」模式。\n'
+                  '按「調整字幕位置」拖曳字幕，完成後恢復滑鼠穿透；主視窗可最小化。',
+                  wraplength=500,foreground='#555555').grid(
+            row=18,column=0,columnspan=2,sticky='w',pady=(8,0))
         self.input_select.bind("<<ComboboxSelected>>", self.save_audio_selection)
         self.output_select.bind("<<ComboboxSelected>>", self.save_audio_selection)
 
         self.refresh_audio_devices()
         self.root.after(50, self.poll_live_captions)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def toggle_positioning(self):
+        if self.overlay.editing:
+            self.overlay.finish_positioning()
+        else:
+            self.overlay.begin_positioning()
+
+    def position_editing_changed(self, editing):
+        self.position_button.configure(text="完成定位" if editing else "調整字幕位置")
+
+    def save_subtitle_position(self, position):
+        try:
+            self.settings = update_settings(subtitle_position=position)
+        except OSError as error:
+            self.status.set(f"字幕已移動，但無法儲存位置：{error}")
+
+    def open_model_manager(self, first_run=False):
+        if self.model_manager and not self.model_manager.closed:
+            self.model_manager.window.lift()
+            return
+        from model_manager import ModelManager
+        self.model_manager = ModelManager(self.root,self.settings,self.save_model_choices,
+            is_busy=lambda:self.router is not None or any(worker.is_alive for worker in self.retiring),first_run=first_run)
+
+    def save_model_choices(self,choices):
+        self.settings = update_settings(**choices)
+        if 'language' in choices and self.router is None:
+            self.language_choice.set(next(k for k,v in LANGUAGES.items() if v==choices['language']))
+        self.health.set('模型選擇已儲存；停止後重新開始即可套用。')
+
+    def _post_event(self,event):
+        try: self.events.put_nowait(event)
+        except Full:
+            try: self.events.get_nowait()
+            except Empty: pass
+            try: self.events.put_nowait(event)
+            except Full: pass
 
     def refresh_audio_devices(self) -> None:
         """Populate routing selectors without changing Windows audio settings."""
@@ -261,11 +217,14 @@ class GameTranslatorApp:
     def start_preview(self) -> None:
         self.is_previewing = True
         self.status.set("預覽中")
-        self.start_button.configure(state="disabled")
+        self.start_button.configure(state="normal", text="再次預覽")
         self.stop_button.configure(state="normal")
         self.set_subtitle_text(self.subtitle_input.get() or PREVIEW_SUBTITLE)
 
     def start_live_audio(self) -> None:
+        if any(worker.is_alive for worker in self.retiring):
+            self.status.set('上一輪模型正在結束，稍後可重新開始…')
+            return
         if self.router is not None:
             return
         capture, playback = self.selected_audio_device_indexes()
@@ -273,19 +232,31 @@ class GameTranslatorApp:
             self.status.set("請先選擇輸入與耳機輸出裝置")
             return
         try:
+            if self.overlay.editing:
+                self.overlay.finish_positioning()
+            self.overlay.hide()
             self.save_audio_selection()
             self.caption_store.clear()
             self.render_history()
             self.generation += 1
             run = self.generation
+            language=LANGUAGES[self.language_choice.get()]
+            model_name=self.settings.get('speech_'+language,'auto')
+            allowed=('auto','tiny.en','base.en','small','turbo') if language=='en' else ('auto','small','turbo')
+            if model_name not in allowed: model_name='auto'
+            translation=self.settings.get('translation','auto')
+            if translation not in ('auto','direct','argos'): translation='auto'
             self.captioner = LiveCaptioner(
-                lambda caption: self.events.put((run, "caption", caption)),
-                lambda error: self.events.put((run, "error", str(error))),
-                lambda: self.events.put((run, "ready", None)),
-                language=LANGUAGES[self.language_choice.get()],
+                lambda caption: self._post_event((run, "caption", caption)),
+                lambda error: self._post_event((run, "error", str(error))),
+                lambda: self._post_event((run, "ready", None)),
+                language=language, model_name=None if model_name=='auto' else model_name,
+                translation=translation,device=self.settings.get('device','auto'),
             )
             self.router = AudioRouter(AudioRoute(capture, playback), self.captioner.submit)
             self.router.start()
+            self.started_at=perf_counter()
+            self.last_sound_at=self.started_at
             self.captioner.start()
         except Exception as error:
             self.stop_preview()
@@ -304,10 +275,14 @@ class GameTranslatorApp:
             self.router = None
         if self.captioner is not None:
             self.captioner.stop()
+            self.retiring.append(self.captioner)
             self.captioner = None
         self.is_previewing = False
         self.status.set("待機")
         self.set_running_controls(False)
+        self.start_button.configure(text="開始預覽")
+        if any(worker.is_alive for worker in self.retiring):
+            self.live_button.configure(state='disabled')
         self.level.set(0)
         self.signal.set("輸入音量｜已停止")
         self.overlay.hide()
@@ -315,6 +290,9 @@ class GameTranslatorApp:
     def poll_live_captions(self) -> None:
         if self.closed:
             return
+        self.retiring=[worker for worker in self.retiring if worker.is_alive]
+        if not self.retiring and not self.router:
+            self.live_button.configure(state='normal')
         try:
             while True:
                 run, kind, value = self.events.get_nowait()
@@ -322,7 +300,9 @@ class GameTranslatorApp:
                     continue
                 if kind == "ready":
                     self.status.set(f"即時翻譯中｜{self.captioner.backend} 模型已就緒")
-                    self.overlay.show_subtitle(f"等待{self.language_choice.get()}語音…")
+                    language = LANGUAGES[self.language_choice.get()]
+                    self.overlay.show_subtitle(f"等待{LANGUAGE_NAMES[language]}語音…")
+                    self.health.set(self.captioner.translation_route+'｜字幕不攔截滑鼠')
                 elif kind == "caption":
                     if not self.caption_store.apply(value):
                         continue
@@ -338,8 +318,24 @@ class GameTranslatorApp:
         except Empty:
             pass
         if self.router:
+            if perf_counter()-self.started_at > 3 and (not self.router.is_running or
+                    perf_counter()-(self.router.last_capture_at or self.started_at) > 3):
+                self.stop_preview()
+                self.status.set('音訊裝置已中斷，請重新掃描並選擇裝置後開始。')
+                self.root.after(50,self.poll_live_captions)
+                return
             self.level.set(min(100, self.router.level * 500))
             self.signal.set("輸入音量｜收到聲音" if self.router.level >= 0.002 else "輸入音量｜安靜／尚未收到聲音")
+            if self.router.level >= 0.002:
+                self.last_sound_at=perf_counter()
+            if self.captioner and self.captioner.ready.is_set():
+                stats=self.captioner.snapshot()
+                skipped=stats['skipped_segments']
+                warning=f'｜忙碌，已略過 {skipped} 段' if skipped else ''
+                fallback='｜GPU 已回退 CPU' if stats['gpu_fallbacks'] else ''
+                self.health.set(f'{self.captioner.translation_route}｜排隊 {stats["recognition_queue"]}/{stats["translation_queue"]}{warning}{fallback}')
+                if perf_counter()-self.last_sound_at > 8:
+                    self.health.set('沒有收到聲音：請確認來源 App 輸出為 CABLE Input。測試自己說話時，接收裝置要選麥克風。')
         self.root.after(50, self.poll_live_captions)
 
     def render_history(self):
@@ -356,8 +352,17 @@ class GameTranslatorApp:
             self.overlay.show_subtitle(text, english_text)
 
     def close(self) -> None:
+        if self.closed: return
         self.closed = True
+        if self.model_manager and not self.model_manager.closed: self.model_manager.close()
         self.stop_preview()
+        self.status.set('正在結束模型，稍候關閉…')
+        self._finish_close()
+
+    def _finish_close(self):
+        if any(worker.is_alive for worker in self.retiring):
+            self.root.after(50,self._finish_close)
+            return
         self.overlay.window.destroy()
         self.root.destroy()
 
@@ -370,18 +375,49 @@ def main() -> None:
     parser.add_argument("--start", action="store_true")
     parser.add_argument("--self-test", type=Path)
     parser.add_argument("--test-wav", type=Path)
-    parser.add_argument("--language", choices=("en", "ja"))
+    parser.add_argument('--headless',action='store_true',help='Silent self-test without desktop windows')
+    parser.add_argument('--check-overlay', type=Path, help='Check hidden subtitle widgets, timers and positioning')
+    parser.add_argument('--check-setup', type=Path, help='Check hidden first-run/model-directory controls')
+    parser.add_argument('--test-translation',choices=('auto','direct','argos'),default='auto')
+    parser.add_argument("--language", choices=("en", "ja", "mixed"))
     args = parser.parse_args()
     if args.self_test and not args.test_wav:
         parser.error("--self-test requires --test-wav")
+    if args.headless and not args.self_test:
+        parser.error('--headless requires --self-test')
     log_path = (Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent) / "GameTranslator.log"
     logging.basicConfig(filename=log_path, level=logging.WARNING, encoding="utf-8")
+    if args.check_setup:
+        from setup_diagnostics import check_setup
+        try: check_setup(args.check_setup)
+        except Exception:
+            logging.exception('Hidden first-run check failed')
+            raise SystemExit(1)
+        return
+    if args.check_overlay:
+        from overlay_diagnostics import check_overlay
+        try:
+            check_overlay(args.check_overlay)
+        except Exception:
+            logging.exception('Hidden overlay check failed')
+            raise SystemExit(1)
+        return
     if args.self_test:
-        from diagnostics import self_test
-        self_test(args.test_wav, args.self_test, args.language or "en")
+        if args.headless:
+            from diagnostics import headless_test
+            try:
+                headless_test(args.test_wav,args.self_test,args.language or 'en',args.test_translation)
+            except Exception:
+                logging.exception('Headless self-test failed')
+                raise SystemExit(1)  # A background test must not show an error dialog.
+        else:
+            from diagnostics import self_test
+            self_test(args.test_wav, args.self_test, args.language or "en")
         return
     root = tk.Tk()
     ui = GameTranslatorApp(root)
+    if not ui.settings.get('setup_completed') and (ui.settings.get('model_directory') or not ui.settings):
+        root.after(300,lambda:ui.open_model_manager(first_run=True))
     if args.language:
         ui.language_choice.set(next(k for k,v in LANGUAGES.items() if v == args.language))
     if args.start:

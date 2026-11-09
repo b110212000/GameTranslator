@@ -15,7 +15,7 @@ from live_captioner import LiveCaptioner
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('wav', type=Path)
-    parser.add_argument('--language', choices=('en','ja'), default='en')
+    parser.add_argument('--language', choices=('en','ja','mixed'), default='en')
     parser.add_argument('--report', type=Path, required=True)
     args = parser.parse_args()
     def offline(*args, **kwargs): raise RuntimeError('Network disabled in benchmark')
@@ -51,6 +51,8 @@ def main():
         assert rows and not errors, report
     finally:
         worker.stop()
+        if worker._thread: worker._thread.join(timeout=30)
+        assert not worker.is_alive, 'Workers did not finish'
 
 
 if __name__ == '__main__': main()

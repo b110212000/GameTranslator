@@ -8,6 +8,9 @@ import sounddevice as sd
 import json
 from pathlib import Path
 import sys
+from threading import RLock
+
+_settings_lock = RLock()
 
 SETTINGS_PATH = (Path(sys.executable).parent if getattr(sys, "frozen", False)
                  else Path(__file__).parent) / "settings.json"
@@ -51,12 +54,18 @@ def read_settings() -> dict:
 
 
 def save_settings(capture: AudioDevice, playback: AudioDevice, language: str = "en") -> None:
-    payload = {"capture": {"name": capture.name, "host_api": capture.host_api},
-               "playback": {"name": playback.name, "host_api": playback.host_api},
-               "language": language}
-    temp = SETTINGS_PATH.with_suffix(".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(SETTINGS_PATH)
+    update_settings(capture={"name": capture.name, "host_api": capture.host_api},
+                    playback={"name": playback.name, "host_api": playback.host_api},language=language)
+
+
+def update_settings(**updates):
+    with _settings_lock:
+        payload = read_settings()
+        payload.update(updates)
+        temp = SETTINGS_PATH.with_suffix(".tmp")
+        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(SETTINGS_PATH)
+        return payload
 
 
 def choose_device(devices: list[AudioDevice], saved: dict, capture: bool) -> AudioDevice | None:

@@ -11,13 +11,14 @@ class PipelineTests(unittest.TestCase):
     def test_japanese_gpu_load_failure_falls_back_to_small_cpu_model(self):
         from audio_pipeline import RecordedAudioPipeline
         with patch('audio_pipeline.cuda_available', return_value=True), \
+             patch('model_catalog.local_model_path', side_effect=lambda key: 'models/'+key), \
              patch('audio_pipeline.LocalTraditionalChineseTranslator'), \
              patch('audio_pipeline.WhisperModel', side_effect=[RuntimeError('GPU unavailable'), object()]) as load:
             with self.assertLogs(level='WARNING'):
-                pipeline = RecordedAudioPipeline(language='ja')
+                pipeline = RecordedAudioPipeline(language='ja',translation='argos')
         self.assertEqual(pipeline.device, 'cpu')
         self.assertEqual(pipeline.model_name, 'small')
-        self.assertEqual(load.call_args_list[0].args[0], 'turbo')
+        self.assertEqual(load.call_args_list[0].args[0], 'models/turbo')
         self.assertEqual(load.call_args_list[1].kwargs['device'], 'cpu')
 
     def test_original_preview_is_published_before_speech_ends(self):
